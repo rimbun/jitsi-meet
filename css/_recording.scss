@@ -1,69 +1,10 @@
-.recordingSpinner {
-    vertical-align: top;
-}
-
-.recording-dialog {
-    flex: 0;
-    flex-direction: column;
-
-    .recording-header {
-        display: flex;
-        flex: 0;
-        flex-direction: row;
-        justify-content: space-between;
-        padding-top: 32px;
-
-        .recording-title {
-            display: inline-flex;
-            align-items: center;
-            font-size: 16px;
-            margin-left: 16px;
-        }
-    }
-
-    .recording-header-line {
-        border-top: 1px solid #5e6d7a;
-    }
-
-    .recording-switch-disabled {
-        opacity: 0.5;
-    }
-
-    .recording-icon-container {
-        display: inline-flex;
-        align-items: center;
-    }
-
-    .recording-icon {
-        width: 32px;
-        height: 32px;
-        object-fit: contain;
-    }
-
-    .recording-switch {
-        margin-left: auto;
-    }
-
-    .authorization-panel {
-        display: flex;
-        flex-direction: column;
-        margin: 0 40px 10px 40px;
-        padding-bottom: 10px;
-
-        .logged-in-panel {
-            padding: 10px;
-        }
-    }
-}
-
 .live-stream-dialog {
     /**
      * Set font-size to be consistent with Atlaskit FieldText.
      */
-    font-size: 14px;
+    font-size: 0.875rem;
 
-    .broadcast-dropdown,
-    .broadcast-dropdown-trigger {
+    .broadcast-dropdown {
         text-align: left;
     }
 
@@ -92,7 +33,7 @@
     }
 
     .google-error {
-        color: $errorColor;
+        color: #c61600;
     }
 
     .google-panel {
@@ -103,16 +44,18 @@
         padding-bottom: 10px;
     }
 
-    .helper-link {
-        cursor: pointer;
-        font-weight: bold;
-        display: inline-block;
-        flex-shrink: 0;
-        margin-left: auto;
-    }
-
     .warning-text {
         color:#FFD740;
-        font-size: 12px;
+        font-size: 0.75rem;
+    }
+
+    .youtube-go-live-warning {
+        margin-bottom: 16px;
+        padding: 8px 12px;
+        background-color: rgba(248, 174, 26, 0.1);
+        border-left: 3px solid #FFD740;
+        font-size: 0.875rem;
+        line-height: 1.25rem;
+        color: #FFD740;
     }
 }

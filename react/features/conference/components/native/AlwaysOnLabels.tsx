@@ -1,0 +1,108 @@
+import React, { useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { TouchableOpacity } from 'react-native';
+import { useDispatch, useSelector } from 'react-redux';
+
+import TranslationLabel from '../../../audio-translation/components/native/TranslationLabel';
+import { JitsiRecordingConstants } from '../../../base/lib-jitsi-meet';
+import { openHighlightDialog } from '../../../recording/actions.native';
+import HighlightButton from '../../../recording/components/Recording/native/HighlightButton';
+import RecordingLabel from '../../../recording/components/native/RecordingLabel';
+import TranscribingLabel from '../../../recording/components/native/TranscribingLabel';
+import { isLiveStreamingRunning } from '../../../recording/functions';
+import VisitorsCountLabel from '../../../visitors/components/native/VisitorsCountLabel';
+
+import RaisedHandsCountLabel from './RaisedHandsCountLabel';
+import TimeTimerLabel from './TimeTimerLabel';
+import {
+    LABEL_ID_AUDIO_TRANSLATION,
+    LABEL_ID_RAISED_HANDS_COUNT,
+    LABEL_ID_RECORDING,
+    LABEL_ID_STREAMING,
+    LABEL_ID_TRANSCRIBING,
+    LABEL_ID_VISITORS_COUNT,
+    LabelHitSlop
+} from './constants';
+
+interface IProps {
+
+    /**
+     * Creates a function to be invoked when the onPress of the touchables are
+     * triggered.
+     */
+    createOnPress: Function;
+}
+
+const AlwaysOnLabels = ({ createOnPress }: IProps) => {
+    const { t } = useTranslation();
+    const dispatch = useDispatch();
+    const isStreaming = useSelector(isLiveStreamingRunning);
+    const openHighlightDialogCallback = useCallback(() =>
+        dispatch(openHighlightDialog()), [ dispatch ]);
+
+    const recordingLabel = t('videoStatus.recording');
+    const streamingLabel = t('videoStatus.streaming');
+    const transcribingLabel = t('transcribing.labelTooltip');
+    const highlightLabel = t('recording.highlight');
+    const raisedHandsLabel = t('raisedHandsLabel');
+    const translationLabel = t('audioTranslation.labelTooltip');
+    const visitorsLabel = t('visitors.labelTooltip');
+
+    return (<>
+        <TouchableOpacity
+            accessibilityLabel = { recordingLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { createOnPress(LABEL_ID_RECORDING) } >
+            <RecordingLabel mode = { JitsiRecordingConstants.mode.FILE } />
+        </TouchableOpacity>
+        {
+            isStreaming
+            && <TouchableOpacity
+                accessibilityLabel = { streamingLabel }
+                accessibilityRole = 'button'
+                hitSlop = { LabelHitSlop }
+                onPress = { createOnPress(LABEL_ID_STREAMING) } >
+                <RecordingLabel mode = { JitsiRecordingConstants.mode.STREAM } />
+            </TouchableOpacity>
+        }
+        <TouchableOpacity
+            accessibilityLabel = { transcribingLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { createOnPress(LABEL_ID_TRANSCRIBING) } >
+            <TranscribingLabel />
+        </TouchableOpacity>
+        <TimeTimerLabel />
+        <TouchableOpacity
+            accessibilityLabel = { highlightLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { openHighlightDialogCallback }>
+            <HighlightButton />
+        </TouchableOpacity>
+        <TouchableOpacity
+            accessibilityLabel = { raisedHandsLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { createOnPress(LABEL_ID_RAISED_HANDS_COUNT) } >
+            <RaisedHandsCountLabel />
+        </TouchableOpacity>
+        <TouchableOpacity
+            accessibilityLabel = { translationLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { createOnPress(LABEL_ID_AUDIO_TRANSLATION) } >
+            <TranslationLabel />
+        </TouchableOpacity>
+        <TouchableOpacity
+            accessibilityLabel = { visitorsLabel }
+            accessibilityRole = 'button'
+            hitSlop = { LabelHitSlop }
+            onPress = { createOnPress(LABEL_ID_VISITORS_COUNT) } >
+            <VisitorsCountLabel />
+        </TouchableOpacity>
+    </>);
+};
+
+export default AlwaysOnLabels;

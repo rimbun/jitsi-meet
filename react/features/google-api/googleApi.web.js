@@ -2,19 +2,48 @@ import {
     API_URL_BROADCAST_STREAMS,
     API_URL_LIVE_BROADCASTS,
     DISCOVERY_DOCS,
+    GOOGLE_POPUP_CLOSED,
     GOOGLE_SCOPE_CALENDAR,
+    GOOGLE_SCOPE_USERINFO,
     GOOGLE_SCOPE_YOUTUBE
 } from './constants';
+import logger from './logger';
 
 const GOOGLE_API_CLIENT_LIBRARY_URL = 'https://apis.google.com/js/api.js';
+const GOOGLE_GIS_LIBRARY_URL = 'https://accounts.google.com/gsi/client';
 
 /**
- * A promise for dynamically loading the Google API Client Library.
+ * How long to wait for a library to load before giving up, in milliseconds.
  *
  * @private
- * @type {Promise}
+ * @type {number}
  */
-let googleClientLoadPromise;
+const LOAD_TIMEOUT = 30000;
+
+/**
+ * How long a failed library load is reused before it can be tried again, in
+ * milliseconds. Avoids a new request for every call while a library is blocked.
+ *
+ * @private
+ * @type {number}
+ */
+const LOAD_RETRY_DELAY = 5000;
+
+/**
+ * The promises for dynamically loading the Google libraries, by library URL.
+ *
+ * @private
+ * @type {Map<string, Promise>}
+ */
+const libraryLoads = new Map();
+
+/**
+ * The URLs of the libraries whose load failed and can be tried again.
+ *
+ * @private
+ * @type {Set<string>}
+ */
+const failedLibraryLoads = new Set();
 
 /**
  * A singleton for loading and interacting with the Google API.
@@ -24,12 +53,19 @@ const googleApi = {
      * Obtains Google API Client Library, loading the library dynamically if
      * needed.
      *
+     * @param {boolean} retryFailedLoads - Whether to try a failed library load
+     * again right away, for a retry requested by the user.
      * @returns {Promise}
      */
-    get() {
+    get(retryFailedLoads = false) {
+        if (retryFailedLoads) {
+            failedLibraryLoads.forEach(url => this._clearFailedLoad(url));
+        }
+
         const globalGoogleApi = this._getGoogleApiClient();
 
-        if (!globalGoogleApi) {
+        // Both the client library and Google Identity Services are needed.
+        if (!globalGoogleApi?.client || !this._getGoogleGISApiClient()?.accounts) {
             return this.load();
         }
 
@@ -50,9 +86,9 @@ const googleApi = {
                 }
 
                 return this._getGoogleApiClient()
-                    .auth2.getAuthInstance()
-                    .currentUser.get()
-                    .getBasicProfile();
+                    .client.oauth2
+                    .userinfo.get().getPromise()
+                    .then(r => r.result);
             });
     },
 
@@ -68,23 +104,45 @@ const googleApi = {
     initializeClient(clientId, enableYoutube, enableCalendar) {
         return this.get()
             .then(api => new Promise((resolve, reject) => {
-                const scope
-                    = `${enableYoutube ? GOOGLE_SCOPE_YOUTUBE : ''} ${enableCalendar ? GOOGLE_SCOPE_CALENDAR : ''}`
-                        .trim();
-
                 // setTimeout is used as a workaround for api.client.init not
                 // resolving consistently when the Google API Client Library is
                 // loaded asynchronously. See:
                 // github.com/google/google-api-javascript-client/issues/399
                 setTimeout(() => {
-                    api.client.init({
-                        clientId,
-                        discoveryDocs: DISCOVERY_DOCS,
-                        scope
+                    api.client.init({})
+                    .then(() => {
+                        if (enableCalendar) {
+                            api.client.load(DISCOVERY_DOCS);
+                        }
+                    })
+                    .then(() => {
+                        api.client.load('https://www.googleapis.com/discovery/v1/apis/oauth2/v1/rest');
                     })
                     .then(resolve)
                     .catch(reject);
                 }, 500);
+            }))
+            .then(() => new Promise((resolve, reject) => {
+                try {
+                    const scope
+                        = `${enableYoutube ? GOOGLE_SCOPE_YOUTUBE : ''} ${enableCalendar ? GOOGLE_SCOPE_CALENDAR : ''}`
+                        .trim();
+
+                    this.tokenClient = this._getGoogleGISApiClient().accounts.oauth2.initTokenClient({
+                        // eslint-disable-next-line camelcase
+                        client_id: clientId,
+                        scope: `${scope} ${GOOGLE_SCOPE_USERINFO}`,
+                        callback: '', // defined at request time in await/promise scope.
+
+                        // Called when the popup fails to open or is closed
+                        // before a response, so the pending request can fail.
+                        // eslint-disable-next-line camelcase
+                        error_callback: error => this._onTokenRequestError?.(error)
+                    });
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
             }));
     },
 
@@ -95,51 +153,114 @@ const googleApi = {
      * @returns {Promise}
      */
     isSignedIn() {
-        return this.get()
-            .then(api => Boolean(api
-                && api.auth2
-                && api.auth2.getAuthInstance
-                && api.auth2.getAuthInstance()
-                && api.auth2.getAuthInstance().isSignedIn
-                && api.auth2.getAuthInstance().isSignedIn.get()));
+        return new Promise((resolve, _) => {
+            const te = parseInt(this.tokenExpires, 10);
+            const isExpired = isNaN(this.tokenExpires) ? true : new Date().getTime() > te;
+
+            resolve(Boolean(!isExpired));
+        });
     },
 
     /**
-     * Generates a script tag and downloads the Google API Client Library.
+     * Generates a script tag.
+     *
+     * @param {string} src - The source for the script tag.
+     * @returns {Promise<unknown>}
+     * @private
+     */
+    _loadScriptTag(src) {
+        return new Promise((resolve, reject) => {
+            const scriptTag = document.createElement('script');
+            let timeout = null;
+
+            const onFailure = message => {
+                clearTimeout(timeout);
+                scriptTag.remove();
+
+                reject(new Error(`${message} ${src}`));
+            };
+
+            timeout = setTimeout(() => onFailure('Timed out loading'), LOAD_TIMEOUT);
+
+            scriptTag.async = true;
+            scriptTag.addEventListener('error', () => onFailure('Failed to load'));
+            scriptTag.addEventListener('load', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+            scriptTag.type = 'text/javascript';
+
+            scriptTag.src = src;
+
+            document.head.appendChild(scriptTag);
+        });
+    },
+
+    /**
+     * Generates script tags and downloads the Google API Client Library and
+     * the Google Identity Services Library. Rejects if either fails to load.
+     * Each library is tracked on its own, so a retry only requests the one
+     * that failed, and not one that is still loading. A script that timed out
+     * can still run later, so a tag is only added if the library is missing.
      *
      * @returns {Promise}
      */
     load() {
-        if (googleClientLoadPromise) {
-            return googleClientLoadPromise;
+        return Promise.all([
+            this._loadLibrary(GOOGLE_API_CLIENT_LIBRARY_URL, () =>
+                (this._getGoogleApiClient() ? Promise.resolve() : this._loadScriptTag(GOOGLE_API_CLIENT_LIBRARY_URL))
+                    .then(() => new Promise((resolve, reject) =>
+                        this._getGoogleApiClient().load('client', {
+                            callback: resolve,
+                            onerror: () => reject(new Error('Failed to load the Google API client')),
+                            ontimeout: () => reject(new Error('Timed out loading the Google API client')),
+                            timeout: LOAD_TIMEOUT
+                        })))),
+            this._loadLibrary(GOOGLE_GIS_LIBRARY_URL, () => {
+                if (this._getGoogleGISApiClient()?.accounts) {
+                    return Promise.resolve();
+                }
+
+                return this._loadScriptTag(GOOGLE_GIS_LIBRARY_URL);
+            })
+        ])
+            .then(() => this._getGoogleApiClient());
+    },
+
+    /**
+     * Loads a library once. A failure is reused for a while, so a blocked
+     * library doesn't cause a new request for every call.
+     *
+     * @param {string} url - The URL of the library.
+     * @param {Function} load - Starts loading the library.
+     * @private
+     * @returns {Promise}
+     */
+    _loadLibrary(url, load) {
+        if (!libraryLoads.has(url)) {
+            libraryLoads.set(url, load().catch(error => {
+                logger.error('Error loading a Google library', error);
+                failedLibraryLoads.add(url);
+                setTimeout(() => this._clearFailedLoad(url), LOAD_RETRY_DELAY);
+
+                throw error;
+            }));
         }
 
-        googleClientLoadPromise = new Promise((resolve, reject) => {
-            const scriptTag = document.createElement('script');
+        return libraryLoads.get(url);
+    },
 
-            scriptTag.async = true;
-            scriptTag.addEventListener('error', () => {
-                scriptTag.remove();
-
-                googleClientLoadPromise = null;
-
-                reject();
-            });
-            scriptTag.addEventListener('load', resolve);
-            scriptTag.type = 'text/javascript';
-
-            scriptTag.src = GOOGLE_API_CLIENT_LIBRARY_URL;
-
-            document.head.appendChild(scriptTag);
-        })
-            .then(() => new Promise((resolve, reject) =>
-                this._getGoogleApiClient().load('client:auth2', {
-                    callback: resolve,
-                    onerror: reject
-                })))
-            .then(() => this._getGoogleApiClient());
-
-        return googleClientLoadPromise;
+    /**
+     * Forgets a failed library load, so the next call tries it again.
+     *
+     * @param {string} url - The URL of the library.
+     * @private
+     * @returns {void}
+     */
+    _clearFailedLoad(url) {
+        if (failedLibraryLoads.delete(url)) {
+            libraryLoads.delete(url);
+        }
     },
 
     /**
@@ -171,25 +292,81 @@ const googleApi = {
      * Prompts the participant to sign in to the Google API Client Library, even
      * if already signed in.
      *
+     * @param {boolean} consent - Whether to show account selection dialog.
      * @returns {Promise}
      */
-    showAccountSelection() {
+    showAccountSelection(consent) {
         return this.get()
-            .then(api => api.auth2.getAuthInstance().signIn());
+            .then(api => new Promise((resolve, reject) => {
+                // Whichever handler below fires first decides the outcome, the
+                // other one is ignored so a late token can't sign the user in
+                // after the request was rejected.
+                let settled = false;
+
+                try {
+                    // Settle this promise if the popup fails to open or is closed.
+                    this._onTokenRequestError = error => {
+                        if (settled) {
+                            return;
+                        }
+
+                        settled = true;
+
+                        if (error?.type === GOOGLE_POPUP_CLOSED) {
+                            logger.info('The Google sign in popup was closed');
+                        } else {
+                            logger.error('Error requesting token', error);
+                        }
+
+                        reject(error);
+                    };
+
+                    // Settle this promise in the response callback for requestAccessToken()
+                    this.tokenClient.callback = resp => {
+                        if (settled) {
+                            return;
+                        }
+
+                        settled = true;
+
+                        if (resp.error !== undefined) {
+                            reject(resp);
+
+                            return;
+                        }
+
+                        // Get the number of seconds the token is valid for, subtract 5 minutes
+                        // to account for differences in clock settings and convert to ms.
+                        const expiresIn = (parseInt(api.client.getToken().expires_in, 10) - 300) * 1000;
+                        const now = new Date();
+                        const expireDate = new Date(now.getTime() + expiresIn);
+
+                        this.tokenExpires = expireDate.getTime().toString();
+
+                        resolve(resp);
+                    };
+
+                    this.tokenClient.requestAccessToken({ prompt: consent ? 'consent' : '' });
+                } catch (err) {
+                    logger.error('Error requesting token', err);
+                    reject(err);
+                }
+            }));
     },
 
     /**
      * Prompts the participant to sign in to the Google API Client Library, if
      * not already signed in.
      *
+     * @param {boolean} consent - Whether to show account selection dialog.
      * @returns {Promise}
      */
-    signInIfNotSignedIn() {
+    signInIfNotSignedIn(consent) {
         return this.get()
             .then(() => this.isSignedIn())
             .then(isSignedIn => {
                 if (!isSignedIn) {
-                    return this.showAccountSelection();
+                    return this.showAccountSelection(consent);
                 }
             });
     },
@@ -201,11 +378,10 @@ const googleApi = {
      */
     signOut() {
         return this.get()
-            .then(api =>
-                api.auth2
-                && api.auth2.getAuthInstance
-                && api.auth2.getAuthInstance()
-                && api.auth2.getAuthInstance().signOut());
+            .then(() => {
+                this.tokenClient = undefined;
+                this.tokenExpires = undefined;
+            });
     },
 
     /**
@@ -334,7 +510,6 @@ const googleApi = {
             });
     },
 
-    /* eslint-disable max-params */
     /**
      * Updates the calendar event and adds a location and text.
      *
@@ -376,7 +551,6 @@ const googleApi = {
 
             });
     },
-    /* eslint-enable max-params */
 
     /**
      * Returns the global Google API Client Library object. Direct use of this
@@ -387,6 +561,17 @@ const googleApi = {
      */
     _getGoogleApiClient() {
         return window.gapi;
+    },
+
+
+    /**
+     * Returns the global Google Identity Services Library object.
+     *
+     * @private
+     * @returns {Object|undefined}
+     */
+    _getGoogleGISApiClient() {
+        return window.google;
     }
 };
 

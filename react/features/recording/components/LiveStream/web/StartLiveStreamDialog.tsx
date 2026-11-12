@@ -1,0 +1,422 @@
+import React from 'react';
+import { Trans } from 'react-i18next';
+import { connect } from 'react-redux';
+
+import { IReduxState } from '../../../../app/types';
+import { translate } from '../../../../base/i18n/functions.web';
+import Dialog from '../../../../base/ui/components/web/Dialog';
+import Spinner from '../../../../base/ui/components/web/Spinner';
+import {
+    loadGoogleAPI,
+    requestAvailableYouTubeBroadcasts,
+    requestLiveStreamsForYouTubeBroadcast,
+    showAccountSelection,
+    signIn,
+    updateProfile
+} from '../../../../google-api/actions';
+import GoogleSignInButton from '../../../../google-api/components/GoogleSignInButton.web';
+import {
+    GOOGLE_API_STATES,
+    GOOGLE_POPUP_CLOSED,
+    GOOGLE_POPUP_FAILED_TO_OPEN
+} from '../../../../google-api/constants';
+import AbstractStartLiveStreamDialog, {
+    IProps as AbstractProps,
+    _mapStateToProps as _abstractMapStateToProps
+} from '../AbstractStartLiveStreamDialog';
+
+import StreamKeyForm from './StreamKeyForm';
+import StreamKeyPicker from './StreamKeyPicker';
+
+/**
+ * The error type used when the Google API libraries could not be loaded.
+ */
+const GOOGLE_API_LOAD_FAILED = 'googleApiLoadFailed';
+
+interface IProps extends AbstractProps {
+
+    /**
+     * The ID for the Google client application used for making stream key
+     * related requests.
+     */
+    _googleApiApplicationClientID?: string;
+}
+
+/**
+ * A React Component for requesting a YouTube stream key to use for live
+ * streaming of the current conference.
+ *
+ * @augments Component
+ */
+class StartLiveStreamDialog
+    extends AbstractStartLiveStreamDialog<IProps> {
+
+    /**
+     * Initializes a new {@code StartLiveStreamDialog} instance.
+     *
+     * @param {IProps} props - The React {@code Component} props to initialize
+     * the new {@code StartLiveStreamDialog} instance with.
+     */
+    constructor(props: IProps) {
+        super(props);
+
+        // Bind event handlers so they are only bound once per instance.
+        this._onGetYouTubeBroadcasts = this._onGetYouTubeBroadcasts.bind(this);
+        this._onInitializeGoogleApi = this._onInitializeGoogleApi.bind(this);
+        this._onGoogleSignIn = this._onGoogleSignIn.bind(this);
+        this._onRequestGoogleSignIn = this._onRequestGoogleSignIn.bind(this);
+        this._onRetryGoogleApi = this._onRetryGoogleApi.bind(this);
+        this._onYouTubeBroadcastIDSelected
+            = this._onYouTubeBroadcastIDSelected.bind(this);
+    }
+
+    /**
+     * Implements {@link Component#componentDidMount()}. Invoked immediately
+     * after this component is mounted.
+     *
+     * @inheritdoc
+     * @returns {void}
+     */
+    override componentDidMount() {
+        super.componentDidMount();
+
+        if (this.props._googleApiApplicationClientID) {
+            this._onInitializeGoogleApi();
+        }
+    }
+
+    /**
+     * Implements {@code Component}'s render.
+     *
+     * @inheritdoc
+     */
+    override render() {
+        const { _googleApiApplicationClientID, t } = this.props;
+
+        return (
+            <Dialog
+                ok = {{ translationKey: 'dialog.startLiveStreaming' }}
+                onCancel = { this._onCancel }
+                onSubmit = { this._onSubmit }
+                titleKey = 'liveStreaming.start'>
+                <div className = 'live-stream-dialog'>
+                    { _googleApiApplicationClientID
+                        ? (
+                            <>
+                                { this._renderYouTubePanel() }
+                                <div className = 'youtube-go-live-warning'>
+                                    { t('liveStreaming.youTubeGoLiveWarning') }
+                                </div>
+                            </>
+                        ) : null }
+                    <StreamKeyForm
+                        onChange = { this._onStreamKeyChange }
+                        value = {
+                            this.state.streamKey || this.props._streamKey || ''
+                        } />
+                </div>
+            </Dialog>
+        );
+    }
+
+    /**
+     * Loads the Google web client application used for fetching stream keys.
+     * If the user is already logged in, then a request for available YouTube
+     * broadcasts is also made.
+     *
+     * @param {boolean} retryFailedLoads - Whether to try a failed library load
+     * again right away.
+     * @private
+     * @returns {void}
+     */
+    _onInitializeGoogleApi(retryFailedLoads = false) {
+        // Back to the spinner while retrying after a failed load.
+        this._setStateIfMounted({ errorType: undefined });
+
+        // The Google API stays unusable after this fails, whatever the reason.
+        this.props.dispatch(loadGoogleAPI(retryFailedLoads))
+        .catch(() => this._setStateIfMounted({ errorType: GOOGLE_API_LOAD_FAILED }));
+    }
+
+    /**
+     * Tries again to load the Google web client application after it failed.
+     *
+     * @private
+     * @returns {void}
+     */
+    _onRetryGoogleApi() {
+        this._onInitializeGoogleApi(true);
+    }
+
+    /**
+     * Automatically selects the input field's value after starting to edit the
+     * display name.
+     *
+     * @inheritdoc
+     * @returns {void}
+     */
+    override componentDidUpdate(previousProps: IProps) {
+        if (previousProps._googleAPIState === GOOGLE_API_STATES.LOADED
+            && this.props._googleAPIState === GOOGLE_API_STATES.SIGNED_IN) {
+            this._onGetYouTubeBroadcasts();
+        }
+    }
+
+    /**
+     * Asks the user to sign in, if not already signed in, and then requests a
+     * list of the user's YouTube broadcasts.
+     *
+     * @private
+     * @returns {void}
+     */
+    override _onGetYouTubeBroadcasts() {
+        this.props.dispatch(updateProfile())
+            .catch((response: any) => this._onGoogleSignInError(response));
+
+        this.props.dispatch(requestAvailableYouTubeBroadcasts())
+            .then((broadcasts: { boundStreamID: string; }[]) => {
+                this._setStateIfMounted({
+                    broadcasts
+                });
+
+                if (broadcasts.length === 1) {
+                    const broadcast = broadcasts[0];
+
+                    this._onYouTubeBroadcastIDSelected(broadcast.boundStreamID);
+                }
+            })
+            .catch((response: any) => this._parseErrorFromResponse(response));
+    }
+
+    /**
+     * Forces the Google web client application to prompt for a sign in, such as
+     * when changing account, and will then fetch available YouTube broadcasts.
+     *
+     * @private
+     * @returns {Promise}
+     */
+    _onGoogleSignIn() {
+        this.props.dispatch(signIn())
+            .catch((response: any) => this._onGoogleSignInError(response));
+    }
+
+    /**
+     * Forces the Google web client application to prompt for a sign in, such as
+     * when changing account, and will then fetch available YouTube broadcasts.
+     *
+     * @private
+     * @returns {Promise}
+     */
+    _onRequestGoogleSignIn() {
+        // when there is an error we show the google sign-in button.
+        // once we click it we want to clear the error from the state
+        this.props.dispatch(showAccountSelection())
+            .then(() =>
+                this._setStateIfMounted({
+                    broadcasts: undefined,
+                    errorType: undefined
+                }))
+            .then(() => this._onGetYouTubeBroadcasts())
+            .catch((response: any) => this._onGoogleSignInError(response));
+    }
+
+    /**
+     * Handles a failed Google sign in. Closing the popup is the user canceling
+     * so it is ignored, but a popup that could not be opened needs a message.
+     *
+     * @param {Object} response - The error from the sign in request.
+     * @private
+     * @returns {void}
+     */
+    _onGoogleSignInError(response: any) {
+        if (response?.type === GOOGLE_POPUP_CLOSED) {
+            return;
+        }
+
+        if (response?.type === GOOGLE_POPUP_FAILED_TO_OPEN) {
+            this._setStateIfMounted({
+                errorType: GOOGLE_POPUP_FAILED_TO_OPEN
+            });
+
+            return;
+        }
+
+        this._parseErrorFromResponse(response);
+    }
+
+    /**
+     * Fetches the stream key for a YouTube broadcast and updates the internal
+     * state to display the associated stream key as being entered.
+     *
+     * @param {string} boundStreamID - The bound stream ID associated with the
+     * broadcast from which to get the stream key.
+     * @private
+     * @returns {Promise}
+     */
+    _onYouTubeBroadcastIDSelected(boundStreamID: string) {
+        this.props.dispatch(
+            requestLiveStreamsForYouTubeBroadcast(boundStreamID))
+            .then(({ streamKey, selectedBoundStreamID }: { selectedBoundStreamID: string; streamKey: string; }) =>
+                this._setStateIfMounted({
+                    streamKey,
+                    selectedBoundStreamID
+                }));
+
+    }
+
+    /**
+     * Only show an error if an external request was made with the Google api.
+     * Do not error if the login in canceled.
+     * And searches in a Google API error response for the error type.
+     *
+     * @param {Object} response - The Google API response that may contain an
+     * error.
+     * @private
+     * @returns {string|null}
+     */
+    _parseErrorFromResponse(response: any) {
+
+        if (!response?.result) {
+            return;
+        }
+
+        const result = response.result;
+        const error = result.error;
+        const errors = error?.errors;
+        const firstError = errors?.[0];
+
+        this._setStateIfMounted({
+            errorType: firstError?.reason || null
+        });
+    }
+
+    /**
+     * Renders a React Element for authenticating with the Google web client.
+     *
+     * @private
+     * @returns {ReactElement}
+     */
+    _renderYouTubePanel() {
+        const {
+            t,
+            _googleProfileEmail
+        } = this.props;
+        const {
+            broadcasts,
+            selectedBoundStreamID
+        } = this.state;
+
+        let googleContent, helpText;
+
+        switch (this.props._googleAPIState) {
+        case GOOGLE_API_STATES.LOADED:
+            googleContent
+                = <GoogleSignInButton onClick = { this._onGoogleSignIn } />;
+            helpText = t('liveStreaming.signInCTA');
+
+            break;
+
+        case GOOGLE_API_STATES.SIGNED_IN:
+            if (broadcasts) {
+                googleContent = (
+                    <StreamKeyPicker
+                        broadcasts = { broadcasts }
+                        onBroadcastSelected
+                            = { this._onYouTubeBroadcastIDSelected }
+                        selectedBoundStreamID = { selectedBoundStreamID } />
+                );
+            } else {
+                googleContent
+                    = <Spinner />
+                ;
+            }
+
+            helpText = (
+                <Trans
+                    components = { [ <a
+                        key = 'change-sign-in'
+                        onClick = { this._onRequestGoogleSignIn } /> ] }
+                    i18nKey = 'liveStreaming.chooseCTAWithChangeSignIn'
+                    t = { t }
+                    values = {{ email: _googleProfileEmail }} />
+            );
+
+            break;
+
+        case GOOGLE_API_STATES.NEEDS_LOADING:
+        default:
+            googleContent
+                = <Spinner />
+            ;
+
+            break;
+        }
+
+        if (this.state.errorType !== undefined) {
+            googleContent = (
+                <GoogleSignInButton
+                    onClick = { this.state.errorType === GOOGLE_API_LOAD_FAILED
+                        ? this._onRetryGoogleApi : this._onRequestGoogleSignIn } />
+            );
+            helpText = this._getGoogleErrorMessageToDisplay();
+        }
+
+        return (
+            <div className = 'google-panel'>
+                <div className = 'live-stream-cta'>
+                    { helpText }
+                </div>
+                <div className = 'google-api'>
+                    { googleContent }
+                </div>
+            </div>
+        );
+    }
+
+    /**
+     * Returns the error message to display for the current error state.
+     *
+     * @private
+     * @returns {string} The error message to display.
+     */
+    _getGoogleErrorMessageToDisplay() {
+        let text;
+
+        switch (this.state.errorType) {
+        case GOOGLE_API_LOAD_FAILED:
+            text = this.props.t('liveStreaming.errorGoogleApiLoad');
+            break;
+        case 'liveStreamingNotEnabled':
+            text = this.props.t(
+                'liveStreaming.errorLiveStreamNotEnabled',
+                { email: this.props._googleProfileEmail });
+            break;
+        case GOOGLE_POPUP_FAILED_TO_OPEN:
+            text = this.props.t('liveStreaming.errorPopupBlocked');
+            break;
+        default:
+            text = this.props.t('liveStreaming.errorAPI');
+            break;
+        }
+
+        return <div className = 'google-error'>{ text }</div>;
+    }
+}
+
+/**
+ * Maps part of the Redux state to the component's props.
+ *
+ * @param {Object} state - The Redux state.
+ * @returns {{
+ *     _googleApiApplicationClientID: string
+ * }}
+*/
+function _mapStateToProps(state: IReduxState) {
+    return {
+        ..._abstractMapStateToProps(state),
+        _googleApiApplicationClientID:
+        state['features/base/config'].googleApiApplicationClientID
+    };
+}
+
+export default translate(connect(_mapStateToProps)(StartLiveStreamDialog));

@@ -1,4 +1,4 @@
-/* global $ */
+import $ from 'jquery';
 
 /**
  * Created by hristo on 12/22/14.
@@ -32,18 +32,6 @@ const UIUtil = {
     },
 
     /**
-     * Redirects to a given URL.
-     *
-     * @param {string} url - The redirect URL.
-     * NOTE: Currently used to redirect to 3rd party location for
-     * authentication. In most cases redirectWithStoredParams action must be
-     * used instead of this method in order to preserve current URL params.
-     */
-    redirect(url) {
-        window.location.href = url;
-    },
-
-    /**
      * Indicates if we're currently in full screen mode.
      *
      * @return {boolean} {true} to indicate that we're currently in full screen
@@ -64,7 +52,7 @@ const UIUtil = {
      * @param {el} The DOM element we'd like to check for visibility
      */
     isVisible(el) {
-        return el.offsetParent !== null;
+        return Boolean(el) && el.offsetParent !== null;
     }
 };
 

@@ -11,26 +11,35 @@ if not muc_domain_base then
     return
 end
 
+local log_not_allowed_errors = module:get_option_boolean('muc_mapper_log_not_allowed_errors', false);
+
 local util = module:require "util";
 local room_jid_match_rewrite = util.room_jid_match_rewrite;
 local internal_room_jid_match_rewrite = util.internal_room_jid_match_rewrite;
 
 -- We must filter stanzas in order to hook in to all incoming and outgoing messaging which skips the stanza routers
-function filter_stanza(stanza)
+function filter_stanza(stanza, session)
+    if stanza.skipMapping or session.type == 's2sout' then
+        return stanza;
+    end
+
     if stanza.name == "message" or stanza.name == "iq" or stanza.name == "presence" then
         -- module:log("debug", "Filtering stanza type %s  to %s from %s",stanza.name,stanza.attr.to,stanza.attr.from);
-        if stanza.name == "iq" then
-            local conf = stanza:get_child('conference')
-            if conf then
-                -- module:log("debug", "Filtering stanza conference %s to %s from %s",conf.attr.room,stanza.attr.to,stanza.attr.from);
-                conf.attr.room = room_jid_match_rewrite(conf.attr.room, stanza)
-            end
-        end
         if stanza.attr.to then
             stanza.attr.to = room_jid_match_rewrite(stanza.attr.to, stanza)
         end
         if stanza.attr.from then
             stanza.attr.from = internal_room_jid_match_rewrite(stanza.attr.from, stanza)
+        end
+
+        if log_not_allowed_errors and stanza.name == 'presence' and stanza.attr.type == 'error' then
+            local error = stanza:get_child('error');
+            if error and error.attr.type == 'cancel'
+                    and error:get_child('not-allowed', 'urn:ietf:params:xml:ns:xmpp-stanzas')
+                    and not session.jitsi_not_allowed_logged then
+                session.jitsi_not_allowed_logged = true;
+                session.log('error', 'Not allowed presence %s', stanza);
+            end
         end
     end
     return stanza;

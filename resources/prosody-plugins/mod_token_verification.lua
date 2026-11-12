@@ -1,28 +1,46 @@
+-- Enforces JWT token room-claim verification at MUC join/create time. Loaded
+-- on the MUC component. For each join or room-create, calls
+-- token_util:verify_room() to check that the token's room claim matches the
+-- target room JID. Admins and domains listed in token_verification_allowlist
+-- are exempt. On a visitor node (main_domain is set) the main participants that
+-- come over s2s are exempt too. On the main prosody a join or room-create over
+-- s2s is refused. Anonymous users (no token) are allowed through. When
+-- token_verification_require_token_for_moderation is set, also blocks room
+-- config IQs (e.g. granting moderator status) from unauthenticated users.
+-- Records the verified conferences on the session (jitsi_meet_verified_rooms)
+-- and answers the 'jitsi-verify-session-rooms' event, so that a session whose
+-- JWT claims are refreshed after the join (mod_auth_token, on stream
+-- resumption) is re-checked against them.
 -- Token authentication
--- Copyright (C) 2015 Atlassian
+-- Copyright (C) 2021-present 8x8, Inc.
 
 local log = module._log;
 local host = module.host;
 local st = require "util.stanza";
-local um_is_admin = require "core.usermanager".is_admin;
+local jid_split = require 'util.jid'.split;
+local jid_bare = require 'util.jid'.bare;
+local jid_host = require 'util.jid'.host;
 
+local util = module:require 'util';
+local is_admin = util.is_admin;
 
-local function is_admin(jid)
-    return um_is_admin(jid, host);
-end
+local DEBUG = false;
+
+local measure_success = module:measure('success', 'counter');
+local measure_fail = module:measure('fail', 'counter');
 
 local parentHostName = string.gmatch(tostring(host), "%w+.(%w.+)")();
 if parentHostName == nil then
-	log("error", "Failed to start - unable to get parent hostname");
-	return;
+    module:log("error", "Failed to start - unable to get parent hostname");
+    return;
 end
 
 local parentCtx = module:context(parentHostName);
 if parentCtx == nil then
-	log("error",
-		"Failed to start - unable to get parent context for host: %s",
-		tostring(parentHostName));
-	return;
+    module:log("error",
+        "Failed to start - unable to get parent context for host: %s",
+        tostring(parentHostName));
+    return;
 end
 
 local token_util = module:require "token/util".new(parentCtx);
@@ -32,60 +50,155 @@ if token_util == nil then
     return;
 end
 
-log("debug",
-	"%s - starting MUC token verifier app_id: %s app_secret: %s allow empty: %s",
-	tostring(host), tostring(token_util.appId), tostring(token_util.appSecret),
-	tostring(token_util.allowEmptyToken));
+module:log("debug",
+    "%s - starting MUC token verifier app_id: %s allow empty: %s",
+    tostring(host), tostring(token_util.appId), tostring(token_util.allowEmptyToken));
 
 -- option to disable room modification (sending muc config form) for guest that do not provide token
 local require_token_for_moderation;
+-- option to allow domains to skip token verification
+local allowlist;
+-- the domain of the main prosody, set only on a visitor node
+local main_domain;
 local function load_config()
     require_token_for_moderation = module:get_option_boolean("token_verification_require_token_for_moderation");
+    allowlist = module:get_option_set('token_verification_allowlist', {});
+    main_domain = module:get_option_string('main_domain');
 end
 load_config();
 
 -- verify user and whether he is allowed to join a room based on the token information
 local function verify_user(session, stanza)
-	log("debug", "Session token: %s, session room: %s",
-		tostring(session.auth_token),
-		tostring(session.jitsi_meet_room));
+    if DEBUG then
+        module:log("debug", "Session token: %s, session room: %s",
+            tostring(util.strip_jwt_signature(session.auth_token)), tostring(session.jitsi_meet_room));
+    end
 
-	-- token not required for admin users
-	local user_jid = stanza.attr.from;
-	if is_admin(user_jid) then
-		log("debug", "Token not required from admin user: %s", user_jid);
-		return true;
-	end
+    -- token not required for admin users
+    local user_jid = stanza.attr.from;
+    if is_admin(user_jid) then
+        if DEBUG then module:log("debug", "Token not required from admin user: %s", user_jid); end
+        return true;
+    end
 
-    log("debug",
-        "Will verify token for user: %s, room: %s ", user_jid, stanza.attr.to);
-    if not token_util:verify_room(session, stanza.attr.to) then
-        log("error", "Token %s not allowed to join: %s",
-            tostring(session.auth_token), tostring(stanza.attr.to));
-        session.send(
-            st.error_reply(
-                stanza, "cancel", "not-allowed", "Room and token mismatched"));
+    -- token not required for users matching allow list
+    local user_bare_jid = jid_bare(user_jid);
+    local _, user_domain = jid_split(user_jid);
+
+    -- allowlist for participants, jigasi (sip & transcriber), jibri (recorder & sip)
+    if allowlist:contains(user_domain)
+        or allowlist:contains(user_bare_jid) then
+        if DEBUG then module:log("debug", "Token not required from user in allow list: %s", user_jid); end
+        return true;
+    end
+
+    if session.type == 's2sin' then
+        -- On a visitor node the main participants come over s2s from the main prosody, which
+        -- checked them when they joined the main room. Every s2s session is let through here:
+        -- it is the s2s_whitelist of the visitor node that limits them to the main prosody.
+        if main_domain then
+            return true;
+        end
+
+        -- On the main prosody nothing joins over s2s: the visitor nodes send the main room
+        -- only messages and iqs.
+        module:log('warn', 'User %s not allowed to join %s over s2s', user_jid, tostring(stanza.attr.to));
+        session.send(st.error_reply(stanza, 'cancel', 'not-allowed', 'Joining over s2s is not allowed'));
+        return false;
+    end
+
+    if DEBUG then module:log("debug", "Will verify token for user: %s, room: %s ", user_jid, stanza.attr.to); end
+    local res, err, reason = token_util:verify_room(session, stanza.attr.to);
+    if not res then
+        if not err and not reason then
+            reason = 'Room and token mismatched';
+        end
+
+        module:log('error', 'User %s not allowed to join: %s token: %s token room: %s token sub: %s err: %s reason: %s',
+                        user_jid, tostring(stanza.attr.to), tostring(util.strip_jwt_signature(session.auth_token)),
+                        tostring(session.jitsi_meet_room),
+                        tostring(session.jitsi_meet_domain), err, reason);
+
+        local response = st.error_reply(stanza, 'cancel', 'not-allowed', reason);
+        if err then
+            response:tag(err, { xmlns = 'http://jitsi.org/jitmeet' });
+        end
+
+        session.send(response);
         return false; -- we need to just return non nil
     end
-	log("debug",
-        "allowed: %s to enter/create room: %s", user_jid, stanza.attr.to);
+    if DEBUG then module:log("debug", "allowed: %s to enter/create room: %s", user_jid, stanza.attr.to); end
+
+    -- Remember every conference this session was verified for, so claims that
+    -- are refreshed later (mod_auth_token, on stream resumption) can be checked
+    -- against all of them without going through a join again. A session can be
+    -- an occupant of several rooms at once.
+    local verified_rooms = session.jitsi_meet_verified_rooms;
+    if not verified_rooms then
+        verified_rooms = {};
+        session.jitsi_meet_verified_rooms = verified_rooms;
+    end
+    verified_rooms[jid_bare(stanza.attr.to)] = true;
+
     return true;
 end
 
 module:hook("muc-room-pre-create", function(event)
-	local origin, stanza = event.origin, event.stanza;
-	log("debug", "pre create: %s %s", tostring(origin), tostring(stanza));
+    local origin, stanza = event.origin, event.stanza;
+    if DEBUG then module:log("debug", "pre create: %s %s", tostring(origin), tostring(stanza)); end
     if not verify_user(origin, stanza) then
+        measure_fail(1);
         return true; -- Returning any value other than nil will halt processing of the event
     end
-end);
+    measure_success(1);
+end, 99);
 
 module:hook("muc-occupant-pre-join", function(event)
-	local origin, room, stanza = event.origin, event.room, event.stanza;
-	log("debug", "pre join: %s %s", tostring(room), tostring(stanza));
+    local origin, room, stanza = event.origin, event.room, event.stanza;
+    if DEBUG then module:log("debug", "pre join: %s %s", tostring(room), tostring(stanza)); end
     if not verify_user(origin, stanza) then
+        measure_fail(1);
         return true; -- Returning any value other than nil will halt processing of the event
     end
+    measure_success(1);
+end, 99);
+
+-- Verifies the token claims currently on a session against every conference it
+-- was verified for on join. Fired by mod_auth_token when a connection resuming
+-- a hibernating session (XEP-0198) presents a different token, which refreshes
+-- the claims of the live session: the hooks above only run at join time, so
+-- this applies the same room check to a session that is already in a room.
+-- Answering with res=false makes mod_auth_token keep the claims that were
+-- verified on join.
+module:hook_global('jitsi-verify-session-rooms', function(event)
+    local session = event.session;
+    local verified_rooms = session.jitsi_meet_verified_rooms;
+
+    if not verified_rooms then
+        return;
+    end
+
+    local get_room_from_jid = prosody.hosts[host].modules.muc.get_room_from_jid;
+
+    for room_jid in pairs(verified_rooms) do
+        -- The event is global: rooms on another MUC component are checked by the
+        -- instance loaded there.
+        -- Being an occupant is deliberately not required: a session that moved
+        -- into a breakout room has left the main room it joined, and that main
+        -- room is still the conference its claims have to cover. Only a room
+        -- that is gone (everyone left while the session was hibernating) is
+        -- skipped.
+        if jid_host(room_jid) == host and get_room_from_jid(room_jid) then
+            local res, err, reason = token_util:verify_room(session, room_jid);
+
+            if not res then
+                measure_fail(1);
+                return { res = false; room = room_jid; error = err; reason = reason; };
+            end
+        end
+    end
+
+    measure_success(1);
 end);
 
 for event_name, method in pairs {
